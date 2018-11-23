@@ -1,0 +1,556 @@
+---
+title: "Aracaju Dashboard"
+output:
+  flexdashboard::flex_dashboard
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(datasus)          # scrapt tabnet
+library(lubridate)        # date variables
+library(dygraphs)         # dynamic graphs
+library(flexdashboard)    # dashboards
+library(xts)              # time series
+library(rvest)            # Parsing of HTML/XML files  
+library(urltools)         # encode/decode urls
+library(RColorBrewer)     # color palletes for graphs
+
+# para não baixar os dados toda vez que for gerado o dashboard
+# mudar para TRUE apenas quando houver atualização dos dados (anualmente)
+atualizar <- FALSE        
+```
+
+
+```{r fn_extrai_tabnet, include=FALSE}
+# esta função é baseada no trabalho de https://github.com/rpradosiqueira/datasus
+extrai_tabnet <- function(pagina, selecoes) {
+  pagina <- httr::POST(url = pagina, body = selecoes)
+  
+  cabecalho <- httr::content(pagina, encoding = "Latin1") %>%
+    rvest::html_nodes("th") %>%
+    rvest::html_text() %>%
+    trimws()
+  
+  dados <- httr::content(pagina, encoding = "Latin1") %>%
+    rvest::html_nodes(".tabdados tbody td") %>%
+    rvest::html_text() %>%
+    trimws()
+  
+  tabela <- as.data.frame(matrix(data = dados, nrow = length(dados)/length(cabecalho),
+                                 ncol = length(cabecalho), byrow = TRUE))
+  
+  names(tabela) <- cabecalho
+  
+  
+  # Tables are scraped with the numbers in Brazilian format that R does not understand
+  f1 <- function(x) x <- gsub("\\.", "", x)
+  f1b <- function(x) x <- gsub("\\,", ".", x)
+  f2 <- function(x) x <- as.numeric(as.character(x))
+  
+  # First column should be text for easy manipulation
+  f3 <- function(x) x <- as.character(x)
+  
+  tabela[-1] <- lapply(tabela[-1], f1)
+  tabela[-1] <- lapply(tabela[-1], f1b)
+  tabela[-1] <- suppressWarnings(lapply(tabela[-1], f2))
+  tabela[1]  <- suppressWarnings(lapply(tabela[1], f3))
+  
+  tabela <- as.tibble(tabela)
+  
+  return(tabela)
+}
+```
+
+
+```{r import_nascidos_vivos, include=FALSE}
+if (!file.exists("nascidos_vivos.rda") | atualizar) {
+  nascidos_vivos_aracaju <-
+  sinasc_nv_uf(
+  uf = "se",
+  linha = "Ano do nascimento",
+  conteudo = 1,
+  periodo = c(1996:2016),
+  municipio = "280030"
+  )
+  
+  nascidos_vivos_sergipe <-
+  sinasc_nv_uf(
+  uf = "se",
+  linha = "Ano do nascimento",
+  conteudo = 1,
+  periodo = c(1996:2016)
+  )
+  
+  nascidos_vivos_brasil <-
+  sinasc_nv_bruf(linha = "Ano do nascimento",
+  conteudo = 1,
+  periodo = c(1996:2016))
+  
+  nascidos_vivos_nordeste <-
+  sinasc_nv_bruf(
+  regiao = "2",
+  linha = "Ano do nascimento",
+  conteudo = 1,
+  periodo = c(1996:2016)
+  )
+  
+  save(
+  nascidos_vivos_aracaju,
+  nascidos_vivos_sergipe,
+  nascidos_vivos_brasil,
+  nascidos_vivos_nordeste,
+  file = "nascidos_vivos.rda"
+  )
+} else {
+load(file = "nascidos_vivos.rda", verbose = TRUE)
+}
+```
+
+
+
+Mortalidade infantil
+===================================================================
+
+### Mortalidade Infantil
+
+```{r import_obitos_menor_de_um_ano_aracaju, include=FALSE}
+if (!file.exists("obt_infant_aracaju.rda") | atualizar) {
+  obt_menor_um_ano <-
+  sim_inf10_uf(
+  uf = "se",
+  linha = "Ano do Óbito",
+  conteudo = 1,
+  periodo = c(1996:2016),
+  municipio = "280030"
+  )
+  
+  save(obt_menor_um_ano, file = "obt_infant_aracaju.rda")
+} else {
+load(file = "obt_infant_aracaju.rda", verbose = TRUE)
+}
+```
+
+
+```{r wrangle_mortalidade_infantil_aracaju}
+# mortalidade_infantil <- 
+#   bind_cols(obt_menor_um_ano, nascidos_vivos_aracaju) %>%
+#   as_tibble() %>%
+#   slice(-1) %>% 
+#   select(ano = `Ano do Óbito`,
+#          obitos = `Óbitos p/Residênc`,
+#          nascimentos = `Nascim p/resid.mãe`) %>%
+#   mutate(
+#     tx_mortalidade_infantil = obitos / nascimentos * 1000,
+#     ic = 1.96 * sqrt(obitos) / nascimentos * 1000,
+#     upper_limit = tx_mortalidade_infantil + ic,
+#     lower_limit = tx_mortalidade_infantil - ic
+#   ) %>%
+#   mutate(ano = make_date(year = paste(ano)))
+
+# Usando o método do National Vital Statistics Reports Volume 67, Number 5 para calcular o intervalo de confiança
+mortalidade_infantil <- 
+  bind_cols(obt_menor_um_ano, nascidos_vivos_aracaju) %>%
+  as_tibble() %>%
+  slice(-1) %>% 
+  select(ano = `Ano do Óbito`,
+         obitos = `Óbitos p/Residênc`,
+         nascimentos = `Nascim p/resid.mãe`) %>%
+  mutate(
+    tx_mortalidade_infantil = obitos / nascimentos * 1000,
+    se = sqrt((obitos / nascimentos^2) + (obitos^2 / nascimentos^3)) * 1000,
+    ic = 1.96 * se,
+    upper_limit = tx_mortalidade_infantil + ic,
+    lower_limit = tx_mortalidade_infantil - ic,
+    rse = 100 * se / tx_mortalidade_infantil
+  ) %>%
+  mutate(ano = make_date(year = paste(ano)))
+
+```
+
+
+```{r xts_mortalidade_infantil_aracaju}
+mortalidade_infantil_xts_aracaju <-
+  xts(x = as.matrix(
+    select(
+      mortalidade_infantil,
+      tx_mortalidade_infantil,
+      upper_limit,
+      lower_limit
+    )
+  ),
+  order.by = mortalidade_infantil$ano)
+```
+
+
+
+
+```{r import_obitos_menor_de_um_ano_sergipe, include=FALSE}
+if(!file.exists("obt_infant_se.rda")) {
+  obt_menor_um_ano <-
+  sim_inf10_uf(
+  uf = "se",
+  linha = "Ano do Óbito",
+  conteudo = 1,
+  periodo = c(1996:2016)
+  )
+  
+  save(obt_menor_um_ano, file = "obt_infant_se.rda")
+} else {
+load(file = "obt_infant_se.rda", verbose = TRUE)
+}
+```
+
+
+```{r wrangle_mortalidade_infantil_sergipe}
+mortalidade_infantil <- 
+  bind_cols(obt_menor_um_ano, nascidos_vivos_sergipe) %>%
+  as_tibble() %>%
+  slice(-1) %>%
+  transmute(ano = `Ano do Óbito`, tx_mortalidade_infantil = `Óbitos p/Residênc`*1000/`Nascim p/resid.mãe`) %>%
+  mutate(ano = make_date(year = paste(ano)))
+```
+
+
+```{r xts_mortalidade_infantil_sergipe}
+mortalidade_infantil_xts_sergipe <- 
+  xts(
+    x = mortalidade_infantil[[2]], 
+    order.by = mortalidade_infantil[[1]]
+  )
+```
+
+
+
+```{r import_obitos_menor_de_um_ano_nordeste, include=FALSE}
+if(!file.exists("obt_infant_ne.rda")) {
+  obt_menor_um_ano <-
+  sim_inf10_bruf(
+  regiao = "2",
+  linha = "Ano do Óbito",
+  conteudo = 1,
+  periodo = c(1996:2016)
+  )
+  
+  save(obt_menor_um_ano, file = "obt_infant_ne.rda")
+} else{
+load(file = "obt_infant_ne.rda", verbose = TRUE)
+}
+```
+
+
+```{r wrangle_mortalidade_infantil_nordeste}
+mortalidade_infantil <- 
+  bind_cols(obt_menor_um_ano, nascidos_vivos_nordeste) %>%
+  as_tibble() %>%
+  slice(-1) %>%
+  transmute(ano = `Ano do Óbito`, tx_mortalidade_infantil = `Óbitos p/Residênc`*1000/`Nascim p/resid.mãe`) %>%
+  mutate(ano = make_date(year = paste(ano)))
+```
+
+
+```{r xts_mortalidade_infantil_nordeste}
+mortalidade_infantil_xts_nordeste <- 
+  xts(
+    x = mortalidade_infantil[[2]], 
+    order.by = mortalidade_infantil[[1]]
+  )
+```
+
+
+
+
+```{r import_obitos_menor_de_um_ano_brasil, include=FALSE}
+if(!file.exists("obt_infant_br.rda")) {
+  obt_menor_um_ano <-
+  sim_inf10_bruf(linha = "Ano do Óbito",
+  conteudo = 1,
+  periodo = c(1996:2016))
+  
+  save(obt_menor_um_ano, file = "obt_infant_br.rda")
+} else
+{
+load(file = "obt_infant_br.rda", verbose = TRUE)
+}
+```
+
+
+```{r wrangle_mortalidade_infantil_brasil}
+# mortalidade_infantil <- 
+#   bind_cols(obt_menor_um_ano, nascidos_vivos_brasil) %>%
+#   as_tibble() %>%
+#   slice(-1) %>%
+#   transmute(ano = `Ano do Óbito`, tx_mortalidade_infantil = `Óbitos p/Residênc`*1000/`Nascim p/resid.mãe`) %>%
+#   mutate(ano = make_date(year = paste(ano)))
+
+mortalidade_infantil <- 
+  bind_cols(obt_menor_um_ano, nascidos_vivos_brasil) %>%
+  as_tibble() %>%
+  slice(-1) %>% 
+  select(ano = `Ano do Óbito`,
+         obitos = `Óbitos p/Residênc`,
+         nascimentos = `Nascim p/resid.mãe`) %>%
+  mutate(
+    tx_mortalidade_infantil_br = obitos / nascimentos * 1000,
+    se = sqrt((obitos / nascimentos^2) + (obitos^2 / nascimentos^3)) * 1000,
+    ic = 1.96 * se,
+    upper_limit_br = tx_mortalidade_infantil_br + ic,
+    lower_limit_br = tx_mortalidade_infantil_br - ic,
+    rse = 100 * se / tx_mortalidade_infantil_br
+  ) %>%
+  mutate(ano = make_date(year = paste(ano)))
+
+
+
+```
+
+
+```{r xts_mortalidade_infantil_brasil}
+mortalidade_infantil_xts_brasil <-
+  xts(x = as.matrix(
+  select(
+  mortalidade_infantil,
+  tx_mortalidade_infantil_br,
+  upper_limit_br,
+  lower_limit_br
+  )
+  ),
+  order.by = mortalidade_infantil$ano)
+```
+
+
+
+
+```{r plot_mortalidade_infantil, fig.width=6, fig.asp=0.618}
+Aracaju <- mortalidade_infantil_xts_aracaju
+Sergipe <- mortalidade_infantil_xts_sergipe
+Nordeste <-  mortalidade_infantil_xts_nordeste
+Brasil <-  mortalidade_infantil_xts_brasil
+
+mortalidade_infantil_xts <- cbind(Aracaju, Sergipe, Nordeste, Brasil)
+
+dygraph(mortalidade_infantil_xts, xlab = "Ano", ylab = "Taxa de Mortalidade Infantil (por mil nascidos vivos") %>%
+  dySeries(c("lower_limit", "tx_mortalidade_infantil", "upper_limit"), label = "Aracaju") %>%
+  dySeries(c("lower_limit_br", "tx_mortalidade_infantil_br", "upper_limit_br"), label = "Brasil") %>%
+  dyRangeSelector() %>%
+  dyOptions(includeZero = TRUE,
+            drawPoints = TRUE,
+            pointSize = 2) %>%
+  dyAxis("x", drawGrid = FALSE) %>%
+  dyLimit(limit = 20) %>%
+  dyOptions(colors = RColorBrewer::brewer.pal(4, "Set2"))
+```
+
+
+
+
+
+
+
+Mortalidade materna
+=================================================================
+
+### Mortalidade materna
+
+
+
+```{r import_obitos_maternos_aracaju}
+pagina <- "http://tabnet.datasus.gov.br/cgi/tabcgi.exe?sim/cnv/mat10se.def"
+
+selecoes <- "Linha=Ano_do_%D3bito&Coluna=--N%E3o-Ativa--&Incremento=%D3bitos_maternos&Arquivos=matse16.dbf&Arquivos=matse15.dbf&Arquivos=matse14.dbf&Arquivos=matse13.dbf&Arquivos=matse12.dbf&Arquivos=matse11.dbf&Arquivos=matse10.dbf&Arquivos=matse09.dbf&Arquivos=matse08.dbf&Arquivos=matse07.dbf&Arquivos=matse06.dbf&Arquivos=matse05.dbf&Arquivos=matse04.dbf&Arquivos=matse03.dbf&Arquivos=matse02.dbf&Arquivos=matse01.dbf&Arquivos=matse00.dbf&Arquivos=matse99.dbf&Arquivos=matse98.dbf&Arquivos=matse97.dbf&Arquivos=matse96.dbf&pesqmes1=Digite+o+texto+e+ache+f%E1cil&SMunic%EDpio=3&SRegi%E3o_de_Sa%FAde_%28CIR%29=TODAS_AS_CATEGORIAS__&SMacrorregi%E3o_de_Sa%FAde=TODAS_AS_CATEGORIAS__&SDivis%E3o_administ_estadual=TODAS_AS_CATEGORIAS__&pesqmes5=Digite+o+texto+e+ache+f%E1cil&SMicrorregi%E3o_IBGE=TODAS_AS_CATEGORIAS__&SRegi%E3o_Metropolitana_-_RIDE=TODAS_AS_CATEGORIAS__&pesqmes7=Digite+o+texto+e+ache+f%E1cil&SCap%EDtulo_CID-10=TODAS_AS_CATEGORIAS__&pesqmes8=Digite+o+texto+e+ache+f%E1cil&SGrupo_CID-10=TODAS_AS_CATEGORIAS__&pesqmes9=Digite+o+texto+e+ache+f%E1cil&SCategoria_CID-10=TODAS_AS_CATEGORIAS__&STipo_causa_obst%E9tr=TODAS_AS_CATEGORIAS__&pesqmes11=Digite+o+texto+e+ache+f%E1cil&SFaixa_Et%E1ria=TODAS_AS_CATEGORIAS__&pesqmes12=Digite+o+texto+e+ache+f%E1cil&SFaixa_Et%E1ria_OPS=TODAS_AS_CATEGORIAS__&pesqmes13=Digite+o+texto+e+ache+f%E1cil&SFaixa_Et%E1ria_det=TODAS_AS_CATEGORIAS__&SCor%2Fra%E7a=TODAS_AS_CATEGORIAS__&SEscolaridade=TODAS_AS_CATEGORIAS__&SEstado_civil=TODAS_AS_CATEGORIAS__&SLocal_ocorr%EAncia=TODAS_AS_CATEGORIAS__&SMorte_grav%2Fpuerp=TODAS_AS_CATEGORIAS__&S%D3bito_investigado=TODAS_AS_CATEGORIAS__&formato=table&mostre=Mostra"
+
+obitos_maternos <- extrai_tabnet(pagina, selecoes)
+
+
+# Aracaju não registrou mortes maternas em 2015
+library(DataCombine)
+obitos_maternos <- InsertRow(obitos_maternos, NewRow = c(2015, 0), RowNum = 21)
+```
+
+```{r wrangle_mortalidade_materna_aracaju}
+mortalidade_materna <-
+  bind_cols(obitos_maternos, nascidos_vivos_aracaju) %>%
+  as_tibble() %>%
+  slice(-1) %>%
+  transmute(ano = `Ano do Óbito`, rz_mortalidade_materna = `Óbitos maternos`*100000/`Nascim p/resid.mãe`) %>%
+  mutate(ano = make_date(year = paste(ano)))
+```
+
+```{r xts_mortalidade_materna_aracaju}
+mortalidade_materna_xts_aracaju <- 
+  xts(
+    x = mortalidade_materna[[2]], 
+    order.by = mortalidade_materna[[1]]
+  )
+```
+
+
+
+
+```{r import_obitos_maternos_sergipe}
+pagina <- "http://tabnet.datasus.gov.br/cgi/tabcgi.exe?sim/cnv/mat10se.def"
+
+selecoes <- "Linha=Ano_do_%D3bito&Coluna=--N%E3o-Ativa--&Incremento=%D3bitos_maternos&Arquivos=matse16.dbf&Arquivos=matse15.dbf&Arquivos=matse14.dbf&Arquivos=matse13.dbf&Arquivos=matse12.dbf&Arquivos=matse11.dbf&Arquivos=matse10.dbf&Arquivos=matse09.dbf&Arquivos=matse08.dbf&Arquivos=matse07.dbf&Arquivos=matse06.dbf&Arquivos=matse05.dbf&Arquivos=matse04.dbf&Arquivos=matse03.dbf&Arquivos=matse02.dbf&Arquivos=matse01.dbf&Arquivos=matse00.dbf&Arquivos=matse99.dbf&Arquivos=matse98.dbf&Arquivos=matse97.dbf&Arquivos=matse96.dbf&pesqmes1=Digite+o+texto+e+ache+f%E1cil&SMunic%EDpio=TODAS_AS_CATEGORIAS__&SRegi%E3o_de_Sa%FAde_%28CIR%29=TODAS_AS_CATEGORIAS__&SMacrorregi%E3o_de_Sa%FAde=TODAS_AS_CATEGORIAS__&SDivis%E3o_administ_estadual=TODAS_AS_CATEGORIAS__&pesqmes5=Digite+o+texto+e+ache+f%E1cil&SMicrorregi%E3o_IBGE=TODAS_AS_CATEGORIAS__&SRegi%E3o_Metropolitana_-_RIDE=TODAS_AS_CATEGORIAS__&pesqmes7=Digite+o+texto+e+ache+f%E1cil&SCap%EDtulo_CID-10=TODAS_AS_CATEGORIAS__&pesqmes8=Digite+o+texto+e+ache+f%E1cil&SGrupo_CID-10=TODAS_AS_CATEGORIAS__&pesqmes9=Digite+o+texto+e+ache+f%E1cil&SCategoria_CID-10=TODAS_AS_CATEGORIAS__&STipo_causa_obst%E9tr=TODAS_AS_CATEGORIAS__&pesqmes11=Digite+o+texto+e+ache+f%E1cil&SFaixa_Et%E1ria=TODAS_AS_CATEGORIAS__&pesqmes12=Digite+o+texto+e+ache+f%E1cil&SFaixa_Et%E1ria_OPS=TODAS_AS_CATEGORIAS__&pesqmes13=Digite+o+texto+e+ache+f%E1cil&SFaixa_Et%E1ria_det=TODAS_AS_CATEGORIAS__&SCor%2Fra%E7a=TODAS_AS_CATEGORIAS__&SEscolaridade=TODAS_AS_CATEGORIAS__&SEstado_civil=TODAS_AS_CATEGORIAS__&SLocal_ocorr%EAncia=TODAS_AS_CATEGORIAS__&SMorte_grav%2Fpuerp=TODAS_AS_CATEGORIAS__&S%D3bito_investigado=TODAS_AS_CATEGORIAS__&formato=table&mostre=Mostra"
+
+obitos_maternos <- extrai_tabnet(pagina, selecoes)
+```
+
+```{r wrangle_mortalidade_materna_sergipe}
+mortalidade_materna <-
+  bind_cols(obitos_maternos, nascidos_vivos_sergipe) %>%
+  as_tibble() %>%
+  slice(-1) %>%
+  transmute(ano = `Ano do Óbito`, rz_mortalidade_materna = `Óbitos maternos`*100000/`Nascim p/resid.mãe`) %>%
+  mutate(ano = make_date(year = paste(ano)))
+```
+
+```{r xts_mortalidade_materna_sergipe}
+mortalidade_materna_xts_se <- 
+  xts(
+    x = mortalidade_materna[[2]], 
+    order.by = mortalidade_materna[[1]]
+  )
+```
+
+
+
+
+
+```{r import_obitos_maternos_brasil}
+pagina <- "http://tabnet.datasus.gov.br/cgi/tabcgi.exe?sim/cnv/mat10uf.def"
+
+selecoes <- "Linha=Ano_do_%D3bito&Coluna=--N%E3o-Ativa--&Incremento=%D3bitos_maternos&Arquivos=matuf16.dbf&Arquivos=matuf15.dbf&Arquivos=matuf14.dbf&Arquivos=matuf13.dbf&Arquivos=matuf12.dbf&Arquivos=matuf11.dbf&Arquivos=matuf10.dbf&Arquivos=matuf09.dbf&Arquivos=matuf08.dbf&Arquivos=matuf07.dbf&Arquivos=matuf06.dbf&Arquivos=matuf05.dbf&Arquivos=matuf04.dbf&Arquivos=matuf03.dbf&Arquivos=matuf02.dbf&Arquivos=matuf01.dbf&Arquivos=matuf00.dbf&Arquivos=matuf99.dbf&Arquivos=matuf98.dbf&Arquivos=matuf97.dbf&Arquivos=matuf96.dbf&SRegi%E3o=TODAS_AS_CATEGORIAS__&pesqmes2=Digite+o+texto+e+ache+f%E1cil&SUnidade_da_Federa%E7%E3o=TODAS_AS_CATEGORIAS__&pesqmes3=Digite+o+texto+e+ache+f%E1cil&SCap%EDtulo_CID-10=TODAS_AS_CATEGORIAS__&pesqmes4=Digite+o+texto+e+ache+f%E1cil&SGrupo_CID-10=TODAS_AS_CATEGORIAS__&pesqmes5=Digite+o+texto+e+ache+f%E1cil&SCategoria_CID-10=TODAS_AS_CATEGORIAS__&STipo_causa_obst%E9tr=TODAS_AS_CATEGORIAS__&pesqmes7=Digite+o+texto+e+ache+f%E1cil&SFaixa_Et%E1ria=TODAS_AS_CATEGORIAS__&pesqmes8=Digite+o+texto+e+ache+f%E1cil&SFaixa_Et%E1ria_OPS=TODAS_AS_CATEGORIAS__&pesqmes9=Digite+o+texto+e+ache+f%E1cil&SFaixa_Et%E1ria_det=TODAS_AS_CATEGORIAS__&SCor%2Fra%E7a=TODAS_AS_CATEGORIAS__&SEscolaridade=TODAS_AS_CATEGORIAS__&SEstado_civil=TODAS_AS_CATEGORIAS__&SLocal_ocorr%EAncia=TODAS_AS_CATEGORIAS__&SMorte_grav%2Fpuerp=TODAS_AS_CATEGORIAS__&S%D3bito_investigado=TODAS_AS_CATEGORIAS__&formato=table&mostre=Mostra"
+
+obitos_maternos <- extrai_tabnet(pagina, selecoes)
+```
+
+```{r wrangle_mortalidade_materna_brasil}
+mortalidade_materna <-
+  bind_cols(obitos_maternos, nascidos_vivos_brasil) %>%
+  as_tibble() %>%
+  slice(-1) %>%
+  transmute(ano = `Ano do Óbito`, rz_mortalidade_materna = `Óbitos maternos`*100000/`Nascim p/resid.mãe`) %>%
+  mutate(ano = make_date(year = paste(ano)))
+```
+
+```{r xts_mortalidade_materna_brasil}
+mortalidade_materna_xts_brasil <- 
+  xts(
+    x = mortalidade_materna[[2]], 
+    order.by = mortalidade_materna[[1]]
+  )
+```
+
+
+
+```{r import_obitos_maternos_nordeste}
+pagina <- "http://tabnet.datasus.gov.br/cgi/tabcgi.exe?sim/cnv/mat10uf.def"
+
+selecoes <- "Linha=Ano_do_%D3bito&Coluna=--N%E3o-Ativa--&Incremento=%D3bitos_maternos&Arquivos=matuf16.dbf&Arquivos=matuf15.dbf&Arquivos=matuf14.dbf&Arquivos=matuf13.dbf&Arquivos=matuf12.dbf&Arquivos=matuf11.dbf&Arquivos=matuf10.dbf&Arquivos=matuf09.dbf&Arquivos=matuf08.dbf&Arquivos=matuf07.dbf&Arquivos=matuf06.dbf&Arquivos=matuf05.dbf&Arquivos=matuf04.dbf&Arquivos=matuf03.dbf&Arquivos=matuf02.dbf&Arquivos=matuf01.dbf&Arquivos=matuf00.dbf&Arquivos=matuf99.dbf&Arquivos=matuf98.dbf&Arquivos=matuf97.dbf&Arquivos=matuf96.dbf&SRegi%E3o=2&pesqmes2=Digite+o+texto+e+ache+f%E1cil&SUnidade_da_Federa%E7%E3o=TODAS_AS_CATEGORIAS__&pesqmes3=Digite+o+texto+e+ache+f%E1cil&SCap%EDtulo_CID-10=TODAS_AS_CATEGORIAS__&pesqmes4=Digite+o+texto+e+ache+f%E1cil&SGrupo_CID-10=TODAS_AS_CATEGORIAS__&pesqmes5=Digite+o+texto+e+ache+f%E1cil&SCategoria_CID-10=TODAS_AS_CATEGORIAS__&STipo_causa_obst%E9tr=TODAS_AS_CATEGORIAS__&pesqmes7=Digite+o+texto+e+ache+f%E1cil&SFaixa_Et%E1ria=TODAS_AS_CATEGORIAS__&pesqmes8=Digite+o+texto+e+ache+f%E1cil&SFaixa_Et%E1ria_OPS=TODAS_AS_CATEGORIAS__&pesqmes9=Digite+o+texto+e+ache+f%E1cil&SFaixa_Et%E1ria_det=TODAS_AS_CATEGORIAS__&SCor%2Fra%E7a=TODAS_AS_CATEGORIAS__&SEscolaridade=TODAS_AS_CATEGORIAS__&SEstado_civil=TODAS_AS_CATEGORIAS__&SLocal_ocorr%EAncia=TODAS_AS_CATEGORIAS__&SMorte_grav%2Fpuerp=TODAS_AS_CATEGORIAS__&S%D3bito_investigado=TODAS_AS_CATEGORIAS__&formato=table&mostre=Mostra"
+
+obitos_maternos <- extrai_tabnet(pagina, selecoes)
+```
+
+```{r wrangle_mortalidade_materna_nordeste}
+mortalidade_materna <-
+  bind_cols(obitos_maternos, nascidos_vivos_nordeste) %>%
+  as_tibble() %>%
+  slice(-1) %>%
+  transmute(ano = `Ano do Óbito`, rz_mortalidade_materna = `Óbitos maternos`*100000/`Nascim p/resid.mãe`) %>%
+  mutate(ano = make_date(year = paste(ano)))
+```
+
+```{r xts_mortalidade_materna_nordeste}
+mortalidade_materna_xts_nordeste <- 
+  xts(
+    x = mortalidade_materna[[2]], 
+    order.by = mortalidade_materna[[1]]
+  )
+```
+
+
+
+
+```{r plot_mortalidade_materna, fig.width=6, fig.asp=0.618}
+Aracaju <- mortalidade_materna_xts_aracaju
+Sergipe <- mortalidade_materna_xts_se
+Nordeste <- mortalidade_materna_xts_nordeste
+Brasil <-  mortalidade_materna_xts_brasil
+
+mortalidade_materna_xts <- cbind(Aracaju, Sergipe, Nordeste, Brasil)
+
+dygraph(mortalidade_materna_xts, xlab = "Ano", ylab = "Razão de Mortalidade Materna (por 100.000 nascidos vivos)") %>%
+  dyRangeSelector() %>%
+  dyOptions(includeZero = TRUE,
+            drawPoints =  TRUE,
+            pointSize = 1) %>%
+  dyAxis("x", drawGrid = FALSE) %>%
+  dyOptions(colors = RColorBrewer::brewer.pal(4, "Set2")) #%>%
+  # dyHighlight(highlightSeriesBackgroundAlpha = 0.2)
+```
+
+
+
+
+
+
+
+
+Cobertura vacinal
+=================================================================
+
+### Cobertura vacinal
+
+```{r import_cobertura_vacinal}
+pagina <- "http://tabnet.datasus.gov.br/cgi/tabcgi.exe?pni/cnv/cpnibr.def"
+
+selecoes <-  "Linha=Ano&Coluna=Imuno&Incremento=Coberturas_Vacinais&Arquivos=cpnibr18.dbf&Arquivos=cpnibr17.dbf&Arquivos=cpnibr16.dbf&Arquivos=cpnibr15.dbf&Arquivos=cpnibr14.dbf&Arquivos=cpnibr13.dbf&Arquivos=cpnibr12.dbf&Arquivos=cpnibr11.dbf&Arquivos=cpnibr10.dbf&Arquivos=cpnibr09.dbf&Arquivos=cpnibr08.dbf&Arquivos=cpnibr07.dbf&Arquivos=cpnibr06.dbf&Arquivos=cpnibr05.dbf&Arquivos=cpnibr04.dbf&Arquivos=cpnibr03.dbf&Arquivos=cpnibr02.dbf&Arquivos=cpnibr01.dbf&Arquivos=cpnibr00.dbf&Arquivos=cpnibr99.dbf&Arquivos=cpnibr98.dbf&Arquivos=cpnibr97.dbf&Arquivos=cpnibr96.dbf&Arquivos=cpnibr95.dbf&Arquivos=cpnibr94.dbf&pesqmes1=Digite+o+texto+e+ache+f%E1cil&SMunic%EDpio=TODAS_AS_CATEGORIAS__&pesqmes2=Digite+o+texto+e+ache+f%E1cil&SCapital=15&pesqmes3=Digite+o+texto+e+ache+f%E1cil&SRegi%E3o_de_Sa%FAde_%28CIR%29=TODAS_AS_CATEGORIAS__&pesqmes4=Digite+o+texto+e+ache+f%E1cil&SMacrorregi%E3o_de_Sa%FAde=TODAS_AS_CATEGORIAS__&pesqmes5=Digite+o+texto+e+ache+f%E1cil&SMicrorregi%E3o_IBGE=TODAS_AS_CATEGORIAS__&pesqmes6=Digite+o+texto+e+ache+f%E1cil&SRegi%E3o_Metropolitana_-_RIDE=TODAS_AS_CATEGORIAS__&pesqmes7=Digite+o+texto+e+ache+f%E1cil&STerrit%F3rio_da_Cidadania=TODAS_AS_CATEGORIAS__&pesqmes8=Digite+o+texto+e+ache+f%E1cil&SMesorregi%E3o_PNDR=TODAS_AS_CATEGORIAS__&SAmaz%F4nia_Legal=TODAS_AS_CATEGORIAS__&SSemi%E1rido=TODAS_AS_CATEGORIAS__&SFaixa_de_Fronteira=TODAS_AS_CATEGORIAS__&SZona_de_Fronteira=TODAS_AS_CATEGORIAS__&SMunic%EDpio_de_extrema_pobreza=TODAS_AS_CATEGORIAS__&pesqmes14=Digite+o+texto+e+ache+f%E1cil&SImuno=1&SImuno=2&SImuno=3&SImuno=4&SImuno=7&SImuno=8&SImuno=9&SImuno=17&formato=table&mostre=Mostra"
+
+cobertura_vacinal <- extrai_tabnet(pagina, selecoes)
+```
+
+```{r wrangle_cobertura_vacinal}
+cobertura_vacinal <-
+  cobertura_vacinal %>%
+    slice(-1) %>%
+    rename(
+      ano = Ano,
+      BCG = `072 BCG`,
+      `Hepatite B` = `099 Hepatite B  em < 1mes`,
+      Rotavirus = `061 Rotavírus Humano`,
+      Meningococo = `053 Meningococo C`,
+      Penta = `080 Penta`,
+      Pneumococica = `012 Pneumocócica`,
+      Polio = `074 Poliomielite`,
+      `Triplice viral` = `021 Tríplice Viral  D1`
+    ) %>%
+    mutate(ano = make_date(year = paste(ano)))
+```
+
+```{r xts_cobertura_vacinal}
+BCG <- xts(x = cobertura_vacinal$BCG, order.by = cobertura_vacinal$ano)
+`Hepatite B` <- xts(x = cobertura_vacinal$`Hepatite B`, order.by = cobertura_vacinal$ano)
+Rotavirus <- xts(x = cobertura_vacinal$Rotavirus, order.by = cobertura_vacinal$ano)
+Meningococo <- xts(x = cobertura_vacinal$Meningococo, order.by = cobertura_vacinal$ano)
+Penta <- xts(x = cobertura_vacinal$Penta, order.by = cobertura_vacinal$ano)
+Pneumococica <- xts(x = cobertura_vacinal$Pneumococica, order.by = cobertura_vacinal$ano)
+Polio <- xts(x = cobertura_vacinal$Polio, order.by = cobertura_vacinal$ano)
+`Triplice viral` <- xts(x = cobertura_vacinal$`Triplice viral`, order.by = cobertura_vacinal$ano)
+
+# cobertura_vacinal_xts_aracaju <- cbind(BCG, `Hepatite B`, Rotavirus, Meningococo, Penta, Pneumococica, Polio, `Triplice viral`) 
+
+# excluindo Hep B pois está incluída na penta e porque a Hep B também tem vacinação p/ adultos
+# excluindo tríplice viral pois é aos 12 meses
+cobertura_vacinal_xts_aracaju <- cbind(BCG, Rotavirus, Meningococo, Penta, Pneumococica, Polio) 
+```
+
+```{r plot_cobertura_vacinal}
+dygraph(cobertura_vacinal_xts_aracaju, xlab = "Ano", ylab = "Cobertura vacinal") %>%
+  dyRangeSelector() %>%
+  dyOptions(includeZero = TRUE,
+            drawPoints = TRUE,
+            pointSize = 2) %>%
+  dyAxis("x", drawGrid = FALSE) %>%
+  dyOptions(colors = RColorBrewer::brewer.pal(6, "Set2")) 
+```
+
+
